@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Galaxy Dino - Phaser Build</title>
+  <style>
+    html,body { margin:0; height:100%; background:#020217; color:#fff; font-family: Arial, Helvetica, sans-serif; }
+    #gameContainer { width:100%; height:100vh; display:flex; align-items:center; justify-content:center; }
+    canvas { max-width:100%; height:auto; }
+    .hint { position: absolute; left:10px; bottom:10px; color: #ddd; font-size:13px; }
+  </style>
+</head>
+<body>
+  <div id="gameContainer"></div>
+  <div class="hint">Teclas: ↑ o Space = saltar, Z o clic = disparar, M = abrir tienda</div>
+
+<script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+<script>
+/*
+  Galaxy Dino - Single-file Phaser game
+  - No external image or sound files required (procedural textures + WebAudio for effects)
+  - Features: menu, HUD, parallax, meteoritos, disparos, explosiones, boss, tienda, skins, mobile controls
+*/
+
+const WIDTH = 900, HEIGHT = 450;
+const GROUND_Y = HEIGHT - 100;
+
+let gameConfig = {
+  type: Phaser.AUTO,
+  width: WIDTH,
+  height: HEIGHT,
+  parent: 'gameContainer',
+  backgroundColor: '#020217',
+  physics: { default: 'arcade', arcade: { gravity: { y: 1200 }, debug: false } },
+  scene: { preload: preload, create: create, update: update }
+};
+
+const game = new Phaser.Game(gameConfig);
+
+function preload() {
+  // Create procedural textures (graphics) and audio in runtime in 'create' phase.
+}
+
+function create() {
+  const scene = this;
+
+  // --- generate simple textures -------------------------------------------------
+  // star texture
+  let g = scene.add.graphics();
+  g.fillStyle(0xffffff,1); g.fillCircle(2,2,2);
+  g.generateTexture('star',4,4); g.clear();
+  // meteor texture (orange circle)
+  g.fillStyle(0xff9933,1); g.fillCircle(24,24,24);
+  g.generateTexture('meteor',48,48); g.clear();
+  // bullet texture
+  g.fillStyle(0xfff0a0,1); g.fillRect(0,0,8,4);
+  g.generateTexture('bullet',8,4); g.clear();
+  // dino body (black) and neon alternative
+  g.fillStyle(0x000000,1); g.fillRoundedRect(0,0,50,36,6);
+  g.generateTexture('dino_blk',50,36); g.clear();
+  g.fillStyle(0x00ffd5,1); g.fillRoundedRect(0,0,50,36,6);
+  g.generateTexture('dino_neon',50,36); g.clear();
+  // explosion particle texture
+  g.fillStyle(0xffcc55,1); g.fillCircle(4,4,4);
+  g.generateTexture('spark',8,8); g.clear();
+  g.destroy();
+
+  // --- parallax backgrounds ----------------------------------------------------
+  createParallax(scene);
+
+  // --- ground (invisible collider) ------------------------------------------------
+  const ground = scene.add.rectangle(WIDTH/2, GROUND_Y+10, WIDTH, 40, 0x333333, 0).setOrigin(0.5);
+  scene.physics.add.existing(ground, true);
+
+  // --- player (dino) -------------------------------------------------------------
+  const skin = localStorage.getItem('skin') || 'default';
+  const texture = (skin === 'neon') ? 'dino_neon' : 'dino_blk';
+  this.player = scene.physics.add.sprite(120, GROUND_Y-36, texture).setScale(1).setCollideWorldBounds(true);
+  this.player.setSize(40,34).setOffset(5,2);
+  this.player.isShooting = false;
+  this.player.canShoot = true;
+  this.player.reloadTime = 400; // ms between shots
+  scene.physics.add.collider(this.player, ground);
+
+  // draw gun as graphics over player via a container
+  this.gun = scene.add.graphics();
+  this.gunDepth = 5;
+
+  // --- bullets group ----------------------------------------------------------------
+  this.bullets = scene.physics.add.group({ classType: Phaser.GameObjects.Sprite, runChildUpdate:true });
+  // --- meteor group -----------------------------------------------------------------
+  this.meteors = scene.physics.add.group({ runChildUpdate:true });
+  // --- particles --------------------------------------------------------------------
+  this.particles = scene.add.particles('spark');
+
+  // --- collisions: bullets vs meteors ------------------------------------------------
+  scene.physics.add.overlap(this.bullets, this.meteors, (b,m)=> {
+    bulletHitMeteor(scene, b, m);
+  });
+
+  // --- HUD & score ------------------------------------------------------------------
+  this.score = 0;
+  this.scoreText = scene.add.text(18,14,'Score: 0',{ fontSize:'22px', color:'#ffffff' }).setDepth(10);
+
+  // --- menu UI ---------------------------------------------------------------------
+  this.menuText = scene.add.text(WIDTH/2, HEIGHT/2 - 40, 'GALAXY DINO', { fontSize:'40px', color:'#00ffd5' }).setOrigin(0.5).setDepth(20);
+  this.startBtn = scene.add.text(WIDTH/2, HEIGHT/2 + 10, 'JUGAR', { fontSize:'26px', color:'#ffffff', backgroundColor:'#003344' }).setOrigin(0.5).setInteractive().setPadding(10).setDepth(20);
+  this.startBtn.on('pointerdown', ()=>{ hideMenu(scene); });
+  this.help = scene.add.text(WIDTH/2, HEIGHT/2 + 50, '↑ / SPACE = Saltar  ·  Z / Clic = Disparar  ·  M = Tienda', { fontSize:'14px', color:'#ddd' }).setOrigin(0.5).setDepth(20);
+  // pause overlay (hidden)
+  this.gameOverText = null;
+
+  // --- controls -------------------------------------------------------------------
+  this.cursors = scene.input.keyboard.createCursorKeys();
+  this.keyZ = scene.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.Z);
+  this.keyM = scene.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.M);
+  scene.input.on('pointerdown', ()=>{ if (!this.menuOpen) playerShoot(scene); });
+
+  // --- mobile simple buttons ------------------------------------------------------
+  createMobileControls(scene);
+
+  // --- spawn loops ----------------------------------------------------------------
+  this.spawnTimer = scene.time.addEvent({ delay: 1100, loop:true, callback: ()=> spawnMeteor(scene) });
+  this.powerTimer = scene.time.addEvent({ delay: 10000, loop:true, callback: ()=> spawnPower(scene) });
+
+  // --- boss (not active until triggered) -----------------------------------------
+  this.boss = null;
+
+  // --- sounds via WebAudio --------------------------------------------------------
+  this.audioCtx = null;
+  try { this.audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){ this.audioCtx = null; }
+  // small flag to avoid autoplay blocking: sounds triggered after user interaction
+
+  // --- apply small camera shader-like effect: we'll do a subtle sine warp via postFX if WebGL pipeline exists. If not, fallback to camera shake effects.
+  this.useWarp = !!scene.game.renderer && scene.game.renderer.type === Phaser.WEBGL;
+  if (this.useWarp) { /* keep as flag; advanced custom pipelines can be added but simpler is fine */ }
+
+  // --- HUD buttons / store -------------------------------------------------------
+  scene.input.keyboard.on('keydown-M', ()=>{ openShop(scene); });
+  // show menu open
+  this.menuOpen = true;
+
+  // start with menu visible
+  // store reference for update
+  this.ground = ground;
+  this.lastShotTime = 0;
+  this.canStart = true;
+
+  // start playing small background animation
+  scene.tweens.addCounter({ from:0, to:1, duration:2000, yoyo:true, repeat:-1, onUpdate: ()=>{} });
+
+  // show initial skin applied
+  applySkin(scene);
+
+  // helper: fit canvas to window
+  window.addEventListener('resize', ()=> fitGame(scene));
+  fitGame(scene);
+}
+
+function hideMenu(scene){
+  scene.menuOpen = false;
+  scene.menuText.destroy(); scene.startBtn.destroy(); scene.help.destroy();
+  // small fade in
+  scene.cameras.main.fadeIn(200);
+}
+
+function createParallax(scene){
+  // create three layers using generated star textures
+  const layer1 = scene.add.tileSprite(0,0,WIDTH,HEIGHT,'star').setOrigin(0).setScrollFactor(0).setTileScale(8);
+  const layer2 = scene.add.tileSprite(0,0,WIDTH,HEIGHT,'star').setOrigin(0).setScrollFactor(0).setAlpha(0.9).setTileScale(4);
+  const layer3 = scene.add.tileSprite(0,0,WIDTH,HEIGHT,'star').setOrigin(0).setScrollFactor(0).setAlpha(0.7).setTileScale(2);
+  // tint layers differently (simulate depth)
+  layer1.tint = 0xddddff; layer2.tint = 0xffffff; layer3.tint = 0xffdddd;
+  scene.parallax = [layer1, layer2, layer3];
+}
+
+function fitGame(scene){
+  const canvas = scene.sys.game.canvas;
+  const ratio = Math.min(window.innerWidth / WIDTH, window.innerHeight / HEIGHT);
+  canvas.style.width = Math.round(WIDTH * ratio) + 'px';
+  canvas.style.height = Math.round(HEIGHT * ratio) + 'px';
+}
+
+// ----------------------- Game logic functions -----------------------------------------------
+function spawnMeteor(scene){
+  const x = WIDTH + 40;
+  const y = 40 + Math.random() * (HEIGHT - 180);
+  const size = 14 + Math.random()*38;
+  const m = scene.meteors.create(x,y,'meteor');
+  m.setDisplaySize(size,size);
+  m.setCircle(size/2);
+  m.setVelocity(-120 - Math.random()*180, 60 + Math.random()*160);
+  m.setData('amplitude', 20 + Math.random()*120);
+  m.setData('t', Math.random()*10);
+  m.setBounce(0.6);
+  m.setDepth(2);
+  m.update = function(time, delta){
+    // sine-wave vertical offset for curved trajectories
+    const t = (this.x / WIDTH) + this.getData('t') + time/2000;
+    this.y += Math.sin(t*3.0) * 0.5 * this.getData('amplitude') * delta/16.0;
+    // if hits ground line (approx)
+    if (this.y > GROUND_Y - (this.displayHeight/2)) {
+      createExplosion(scene, this.x, GROUND_Y - 30, Math.round(this.displayWidth/2));
+      this.destroy();
+      return;
+    }
+  };
+}
+
+function spawnPower(scene){
+  const p = scene.physics.add.sprite(WIDTH+20, 80 + Math.random()*250, 'bullet').setTint(0x00ff00);
+  p.setVelocityX(-140);
+  p.setDepth(3);
+  scene.physics.add.overlap(p, scene.player, ()=>{ p.destroy(); givePower(scene); });
+  scene.time.delayedCall(8000, ()=> { if (p && p.destroy) p.destroy(); });
+}
+
+function givePower(scene){
+  // simple: give 100 score + set skin to neon
+  scene.score += 100;
+  localStorage.setItem('coins', (parseInt(localStorage.getItem('coins')||'0') + 50));
+  localStorage.setItem('skin','neon');
+  applySkin(scene);
+  scene.scoreText.setText('Score: ' + scene.score);
+  scene.cameras.main.shake(200, 0.01);
+  playBeep(scene, 800, 0.06);
+}
+
+// bullets
+function playerShoot(scene){
+  const now = scene.time.now;
+  if (scene.menuOpen) return;
+  if (now - scene.lastShotTime < scene.player.reloadTime) return;
+  scene.lastShotTime = now;
+  // create bullet
+  const b = scene.physics.add.sprite(scene.player.x + 36, scene.player.y + 14, 'bullet');
+  b.setVelocityX(650);
+  b.setDepth(5);
+  b.setCollideWorldBounds(false);
+  scene.bullets.add(b);
+  // muzzle particle
+  scene.particles.createEmitter({ x: b.x, y: b.y, speed: { min: -80, max: 80 }, quantity: 6, lifespan: 300, scale: { start:0.6, end:0 } }).explode(6, b.x, b.y);
+  playBeep(scene, 1400, 0.02);
+}
+
+// when bullet hits meteor
+function bulletHitMeteor(scene, bullet, meteor){
+  if (bullet && bullet.destroy) bullet.destroy();
+  createExplosion(scene, meteor.x, meteor.y, Math.round(meteor.displayWidth/2));
+  if (meteor && meteor.destroy) meteor.destroy();
+  scene.score += 10;
+  scene.scoreText.setText('Score: ' + scene.score);
+  playBeep(scene, 400, 0.04);
+}
+
+// create explosion with particles
+function createExplosion(scene, x, y, size){
+  const emitter = scene.particles.createEmitter({ x:x, y:y, speed: { min:-240, max:240 }, scale: { start: 0.8, end:0 }, alpha: { start:1, end:0 }, lifespan: 700, quantity: Math.min(32, Math.max(8, size/2)) });
+  emitter.explode(Math.min(40, Math.max(8, Math.round(size/2))), x, y);
+  scene.cameras.main.shake(120, 0.01);
+  playBeep(scene, 60 + Math.random()*800, 0.02);
+  scene.time.delayedCall(700, ()=> emitter.manager.removeEmitter(emitter));
+}
+
+// simple beep via WebAudio oscillator (very small tones)
+function playBeep(scene, freq, vol){
+  if (!scene.audioCtx) return;
+  try {
+    const ctx = scene.audioCtx;
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = 'sine';
+    o.frequency.value = freq;
+    g.gain.value = vol;
+    o.connect(g); g.connect(ctx.destination);
+    o.start();
+    setTimeout(()=>{ o.stop(); }, 120);
+  } catch(e){}
+}
+
+// --- Boss mechanics ----------------------------------------------------------
+function spawnBoss(scene){
+  if (scene.boss) return;
+  scene.boss = scene.physics.add.sprite(WIDTH+200, 180, 'meteor').setScale(4).setDepth(6).setImmovable(true);
+  scene.boss.hp = 300;
+  scene.physics.add.overlap(scene.bullets, scene.boss, (b,bo)=>{
+    if (b && b.destroy) b.destroy();
+    bo.hp -= 20;
+    createExplosion(scene, bo.x + (Math.random()*40-20), bo.y + (Math.random()*20-10), 40);
+    if (bo.hp <= 0) {
+      createExplosion(scene, bo.x, bo.y, 140);
+      bo.destroy();
+      scene.boss = null;
+      showVictory(scene);
+    }
+  });
+  // boss movement
+  scene.tweens.add({ targets: scene.boss, x: WIDTH - 150, duration: 3000, ease: 'Power2', onComplete: ()=>{} });
+}
+
+// victory
+function showVictory(scene){
+  scene.physics.pause();
+  const box = scene.add.rectangle(WIDTH/2, HEIGHT/2, 560, 260, 0x000000, 0.7).setDepth(20);
+  scene.add.text(WIDTH/2, HEIGHT/2 - 40, 'VICTORIA', { fontSize:'44px', color:'#00ffb3' }).setOrigin(0.5).setDepth(21);
+  scene.add.text(WIDTH/2, HEIGHT/2 + 10, 'Puntaje: ' + scene.score, { fontSize:'24px', color:'#fff' }).setOrigin(0.5).setDepth(21);
+}
+
+// --- shop / skins -----------------------------------------------------------
+function openShop(scene){
+  if (scene.menuOpen) return;
+  scene.physics.pause();
+  const panel = scene.add.rectangle(WIDTH/2, HEIGHT/2, 420, 260, 0x111111, 0.95).setDepth(30);
+  const title = scene.add.text(WIDTH/2, HEIGHT/2 - 88, 'TIENDA', { fontSize:'28px', color:'#fff' }).setOrigin(0.5).setDepth(31);
+  const desc = scene.add.text(WIDTH/2 - 120, HEIGHT/2 - 28, 'Skin Neón - 100 coins', { fontSize:'18px', color:'#ddd' }).setDepth(31);
+  const buy = scene.add.text(WIDTH/2 + 100, HEIGHT/2 - 30, 'COMPRAR', { fontSize:'18px', color:'#00ffea' }).setInteractive().setDepth(31);
+  buy.on('pointerdown', ()=>{
+    let coins = parseInt(localStorage.getItem('coins')||'0');
+    if (coins >= 100) {
+      coins -= 100; localStorage.setItem('coins', coins); localStorage.setItem('skin','neon');
+      desc.setText('Comprado!'); applySkin(scene);
+    } else {
+      desc.setText('Necesitas 100 coins (consigue power-ups)');
+    }
+  });
+  const close = scene.add.text(WIDTH/2, HEIGHT/2 + 80, 'CERRAR', { fontSize:'18px', color:'#fff' }).setOrigin(0.5).setInteractive().setDepth(31);
+  close.on('pointerdown', ()=>{
+    panel.destroy(); title.destroy(); desc.destroy(); buy.destroy(); close.destroy();
+    scene.physics.resume();
+  });
+}
+
+// apply skin (tint)
+function applySkin(scene){
+  const skin = localStorage.getItem('skin') || 'default';
+  if (skin === 'neon') {
+    scene.player.setTexture('dino_neon');
+  } else {
+    scene.player.setTexture('dino_blk');
+  }
+}
+
+// mobile controls: simple large invisible zones
+function createMobileControls(scene){
+  const jumpBtn = scene.add.rectangle(WIDTH - 140, HEIGHT - 80, 260, 160, 0x000000, 0.05).setInteractive().setDepth(9);
+  jumpBtn.on('pointerdown', ()=> { if (scene.player.body.touching.down) scene.player.setVelocityY(-520); });
+  // shoot zone
+  const shootBtn = scene.add.rectangle(WIDTH - 360, HEIGHT - 80, 160, 160, 0x000000, 0.05).setInteractive().setDepth(9);
+  shootBtn.on('pointerdown', ()=> { playerShoot(scene); applyShootAnim(scene); });
+}
+
+// shoot animation simple (scale pop)
+function applyShootAnim(scene){
+  scene.tweens.add({ targets: scene.player, scale: 1.05, duration: 80, yoyo:true });
+  playBeep(scene, 1400, 0.02);
+}
+
+// --- main update loop --------------------------------------------------------
+function update(time, delta) {
+  const scene = this;
+  // parallax movement
+  if (scene.parallax && scene.parallax.length) {
+    scene.parallax[0].tilePositionX += 0.2;
+    scene.parallax[1].tilePositionX += 0.6;
+    scene.parallax[2].tilePositionX += 1.2;
+  }
+
+  // menu state: wait for user to click play
+  if (scene.menuOpen) {
+    if (scene.startBtn && scene.startBtn.input && scene.startBtn.input.enabled) {
+      // waiting for click to start => nothing to update
+      // resume audio context on first interaction to avoid browser blocks
+      scene.input.once('pointerdown', ()=>{ if (scene.audioCtx && scene.audioCtx.state === 'suspended') scene.audioCtx.resume(); });
+      return;
+    }
+  }
+
+  // controls: jump and shoot
+  if ((scene.cursors.up.isDown || scene.cursors.space && scene.cursors.space.isDown) && scene.player.body.touching.down) {
+    scene.player.setVelocityY(-520);
+    playBeep(scene, 800, 0.04);
+    scene.particles.createEmitter({ x: scene.player.x-6, y: GROUND_Y-20, speed: { min:-40, max:40 }, quantity: 8, lifespan: 400, scale: { start: 0.6, end:0 } }).explode(8, scene.player.x-6, GROUND_Y-20);
+  }
+  if (Phaser.Input.Keyboard.JustDown(scene.keyZ)) { playerShoot(scene); applyShootAnim(scene); if (scene.audioCtx && scene.audioCtx.state === 'suspended') scene.audioCtx.resume(); }
+
+  // update meteors custom update function if present
+  scene.meteors.children.each(function(m){ if (m.update) m.update(time, delta); }, this);
+
+  // move bullets cleanup
+  scene.bullets.children.each(function(b){ if (b.x > WIDTH + 50) b.destroy(); });
+
+  // condition to spawn boss (example: score threshold)
+  if (!scene.boss && scene.score >= 500) {
+    spawnBoss(scene);
+  }
+
+  // if boss exists, move health bar update (no separate UI here beyond victory)
+}
+
+// ---------------- Utility / debug / extras ----------------------------------------
+function showGameOver(scene){
+  scene.physics.pause();
+  scene.add.text(WIDTH/2, HEIGHT/2 - 20, 'GAME OVER', { fontSize:'40px', color:'#ff3a3a' }).setOrigin(0.5).setDepth(20);
+}
+
+function playSoundFallback(){ /* intentionally empty for environments without WebAudio */ }
+
+// Create a downloadable ZIP? Not in-game. The repo will use this index.html directly.
+</script>
+</body>
+</html>
